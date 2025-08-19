@@ -4,27 +4,13 @@ import re
 from collections import Counter, defaultdict
 import argparse
 import os
-import numpy as np
+import math
+from datetime import datetime
 
-# --- NEW: Import new libraries for hybrid ranking and sub-section analysis ---
-from sentence_transformers import SentenceTransformer, util
-from rank_bm25 import BM25Okapi
-import nltk
-
-# --- NEW: Pre-download NLTK data. This should be run once.
-# In your Dockerfile, you should add these lines to ensure offline access:
-# RUN python -c "import nltk; nltk.download('punkt'); nltk.download('stopwords')"
-try:
-    nltk.data.find('tokenizers/punkt')
-except nltk.downloader.DownloadError:
-    nltk.download('punkt')
-try:
-    nltk.data.find('corpora/stopwords')
-except nltk.downloader.DownloadError:
-    nltk.download('stopwords')
-
-from nltk.corpus import stopwords
-stop_words = set(stopwords.words('english'))
+# Offline-friendly stop words (small static set)
+_STOP_WORDS = {
+    'the','and','a','an','of','to','in','for','on','with','is','are','it','this','that','as','by','from','or','be','at','we','you','your','our','their','was','were','but','not','can','will','should','could','may','might','into','over','under','about'
+}
 
 
 # =====================================================================================
@@ -35,7 +21,7 @@ class PDFOutlineExtractor:
     Extracts a hierarchical outline using an advanced, multi-pass structural
     analysis pipeline for high-precision heading detection.
     """
-    def _init_(self, pdf_path: str):
+    def __init__(self, pdf_path: str):
         try:
             if len(pdf_path) > 260 and re.match(r'^[a-zA-Z]:\\', pdf_path):
                  pdf_path = "\\\\?\\" + pdf_path
@@ -191,7 +177,7 @@ class PDFOutlineExtractor:
 # COMPONENT 2: Document Sectionizer (No changes needed)
 # =====================================================================================
 class DocumentSectionizer:
-    def _init_(self, pdf_path: str):
+    def __init__(self, pdf_path: str):
         self.doc = fitz.open(pdf_path)
         # Use a more robust way to handle potential empty outlines
         outline_data = PDFOutlineExtractor(pdf_path).get_outline()
@@ -243,78 +229,68 @@ class QueryProcessor:
     def get_keywords(self, text: str, max_keywords=10) -> list:
         """Extracts keywords by removing stop words and taking most frequent terms."""
         words = re.findall(r'\b\w+\b', text.lower())
-        filtered_words = [word for word in words if word not in stop_words and len(word) > 2]
+        filtered_words = [word for word in words if word not in _STOP_WORDS and len(word) > 2]
         return [word for word, freq in Counter(filtered_words).most_common(max_keywords)]
 
 # --- NEW: COMPONENT 4: Hybrid Ranker (Replaces SemanticRanker) ---
 class HybridRanker:
-    def _init_(self, model_path='all-MiniLM-L6-v2-local', alpha=0.7):
-        try:
-            self.model = SentenceTransformer(model_path)
-            self.alpha = alpha # Weight for semantic score
-        except Exception as e:
-            raise IOError(f"Failed to load model from {model_path}. Error: {e}")
+    def __init__(self, alpha: float = 1.0):
+        # alpha retained for future extension; lexical-only for offline operation
+        self.alpha = alpha
 
-    def _normalize_scores(self, scores: list) -> list:
-        """Normalizes scores to a 0-1 range."""
-        min_score, max_score = min(scores), max(scores)
-        if max_score == min_score:
-            return [0.5] * len(scores) # Avoid division by zero
-        return [(s - min_score) / (max_score - min_score) for s in scores]
+    def _idf(self, terms: list, documents: list) -> dict:
+        num_docs = len(documents)
+        df = Counter()
+        for doc in documents:
+            tokens = set(re.findall(r'\b\w+\b', doc.lower()))
+            for t in terms:
+                if t in tokens:
+                    df[t] += 1
+        idf = {}
+        for t in terms:
+            idf[t] = math.log((num_docs + 1) / (df[t] + 1)) + 1.0
+        return idf
 
-    def rank_sections(self, query: str, query_keywords: list, all_sections: list) -> list:
-        if not all_sections: return [], None
-        
-        section_contents = [sec['content'] for sec in all_sections]
-        
-        # 1. Semantic Scoring
-        query_embedding = self.model.encode(query, convert_to_tensor=True)
-        section_embeddings = self.model.encode(section_contents, convert_to_tensor=True)
-        semantic_scores = util.cos_sim(query_embedding, section_embeddings).tolist()[0]
-        
-        # 2. Lexical Scoring (BM25)
-        tokenized_corpus = [doc.lower().split() for doc in section_contents]
-        bm25 = BM25Okapi(tokenized_corpus)
-        lexical_scores = bm25.get_scores(query_keywords)
-
-        # 3. Hybrid Scoring
-        norm_semantic = self._normalize_scores(semantic_scores)
-        norm_lexical = self._normalize_scores(lexical_scores)
-        
-        for i, section in enumerate(all_sections):
-            hybrid_score = (self.alpha * norm_semantic[i]) + ((1 - self.alpha) * norm_lexical[i])
-            section['relevance_score'] = hybrid_score
-            
-        return sorted(all_sections, key=lambda x: x['relevance_score'], reverse=True), query_embedding
+    def rank_sections(self, query: str, query_keywords: list, all_sections: list):
+        if not all_sections:
+            return [], None
+        corpus = [sec['content'] for sec in all_sections]
+        idf = self._idf(query_keywords, corpus)
+        for section in all_sections:
+            words = re.findall(r'\b\w+\b', section['content'].lower())
+            tf = Counter(words)
+            score = 0.0
+            for q in query_keywords:
+                score += tf.get(q, 0) * idf.get(q, 0.0)
+            # Normalize by document length to avoid long-section bias
+            denom = math.log(len(words) + 1) + 1
+            section['relevance_score'] = score / denom
+        return sorted(all_sections, key=lambda x: x['relevance_score'], reverse=True), None
 
 # --- NEW: COMPONENT 5: Sub-Section Analyzer ---
 class SubSectionAnalyzer:
-    def _init_(self, model):
-        self.model = model
+    def __init__(self):
+        pass
 
-    def get_refined_text(self, section_content: str, query_embedding, num_sentences=5) -> str:
-        """Performs extractive summarization to find the most relevant sentences."""
-        sentences = nltk.sent_tokenize(section_content)
-        if not sentences: return ""
-        
-        sentence_embeddings = self.model.encode(sentences, convert_to_tensor=True)
-        similarities = util.cos_sim(query_embedding, sentence_embeddings).tolist()[0]
-        
-        # Pair sentences with their scores and original index
-        scored_sentences = []
-        for i, sentence in enumerate(sentences):
-             # Give a slight bonus to the first sentence (often a topic sentence)
-            score = similarities[i] + (0.1 if i == 0 else 0)
-            scored_sentences.append((score, i, sentence))
+    def _split_sentences(self, text: str):
+        # Simple rule-based sentence splitter
+        parts = re.split(r'(?<=[\.!?])\s+', text.strip())
+        return [p.strip() for p in parts if p.strip()]
 
-        # Sort by score, take top N
-        scored_sentences.sort(key=lambda x: x[0], reverse=True)
-        top_sentences = scored_sentences[:num_sentences]
-        
-        # Sort back by original index to maintain logical flow
-        top_sentences.sort(key=lambda x: x[1])
-        
-        return " ".join([s[2] for s in top_sentences])
+    def get_refined_text(self, section_content: str, query_keywords, num_sentences=5) -> str:
+        sentences = self._split_sentences(section_content)
+        if not sentences:
+            return ""
+        scores = []
+        for idx, sent in enumerate(sentences):
+            words = re.findall(r'\b\w+\b', sent.lower())
+            score = sum(1 for w in words if w in query_keywords)
+            if idx == 0:
+                score += 0.2  # slight boost to the first sentence
+            scores.append((score, idx, sent))
+        scores.sort(key=lambda x: (x[0], -x[1]), reverse=True)
+        top = sorted(scores[:num_sentences], key=lambda x: x[1])
+        return " ".join(s[2] for s in top)
 
 # =====================================================================================
 # MAIN EXECUTION BLOCK (MODIFIED)
@@ -326,17 +302,19 @@ def main():
     parser.add_argument("output_dir", type=str, help="Path to the main output directory.")
     args = parser.parse_args()
 
-    # --- MODIFIED: Load models and analyzers once ---
-    model_path = os.environ.get("MODEL_PATH", "all-MiniLM-L6-v2-local")
-    ranker = HybridRanker(model_path=model_path, alpha=0.7)
-    sub_section_analyzer = SubSectionAnalyzer(model=ranker.model)
+    # Offline-friendly components
+    ranker = HybridRanker(alpha=1.0)
+    sub_section_analyzer = SubSectionAnalyzer()
     query_processor = QueryProcessor()
     
-    # --- MODIFIED: Loop through each test case directory in the input folder ---
-    for collection_name in os.listdir(args.input_dir):
-        collection_dir = os.path.join(args.input_dir, collection_name)
-        if not os.path.isdir(collection_dir):
-            continue
+    processed_any = False
+
+    # If there are subdirectories, treat each as a collection; otherwise treat input_dir itself
+    entries = [d for d in os.listdir(args.input_dir) if os.path.isdir(os.path.join(args.input_dir, d))]
+    collection_roots = entries if entries else ["."]
+
+    for collection_name in collection_roots:
+        collection_dir = os.path.join(args.input_dir, collection_name) if collection_name != "." else args.input_dir
 
         print(f"--- Processing Collection: {collection_name} ---")
         input_json_path = os.path.join(collection_dir, 'challenge1b_input.json')
@@ -353,7 +331,9 @@ def main():
         query_keywords = query_processor.get_keywords(query_text)
 
         documents = config.get('documents', [])
-        pdf_dir = os.path.join(collection_dir, 'PDFs')
+        # Look for PDFs next to the JSON first; if the 'PDFs' subfolder exists, prefer it
+        candidate_pdf_dir = os.path.join(collection_dir, 'PDFs')
+        pdf_dir = candidate_pdf_dir if os.path.isdir(candidate_pdf_dir) else collection_dir
         
         all_sections = []
         for doc in documents:
@@ -383,7 +363,8 @@ def main():
             "metadata": {
                 "input_documents": [doc['filename'] for doc in documents],
                 "persona": persona,
-                "job_to_be_done": job_to_be_done
+                "job_to_be_done": job_to_be_done,
+                "processing_timestamp": datetime.utcnow().isoformat()
             },
             "extracted_sections": [],
             "subsection_analysis": []
@@ -399,7 +380,7 @@ def main():
             
         print("  - Generating refined text for top sections...")
         for section in ranked_sections[:5]:
-            refined_text = sub_section_analyzer.get_refined_text(section['content'], query_embedding)
+            refined_text = sub_section_analyzer.get_refined_text(section['content'], query_keywords)
             output_data["subsection_analysis"].append({
                 "document": section['document'],
                 "refined_text": refined_text,
@@ -407,14 +388,18 @@ def main():
             })
         
         # --- MODIFIED: Create a subdirectory in the output for each collection ---
-        collection_output_dir = os.path.join(args.output_dir, collection_name)
+        collection_output_dir = os.path.join(args.output_dir, collection_name) if collection_name != "." else args.output_dir
         os.makedirs(collection_output_dir, exist_ok=True)
-        output_json_path = os.path.join(collection_output_dir, 'challenge1b_output.json')
+        output_json_path = os.path.join(collection_output_dir, 'challenge1b_output.json') if collection_name != "." else os.path.join(collection_output_dir, 'output.json')
 
         with open(output_json_path, 'w', encoding='utf-8') as f:
             json.dump(output_data, f, indent=4, ensure_ascii=False)
         
         print(f"--- Analysis for {collection_name} complete. Output saved to {output_json_path} ---\n")
+        processed_any = True
 
-if _name_ == "_main_":
+    if not processed_any:
+        print("No valid collections found to process.")
+
+if __name__ == "__main__":
     main()

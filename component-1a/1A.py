@@ -13,7 +13,7 @@ class PDFOutlineExtractor:
     including articles, reports, and forms.
     """
 
-    def _init_(self, pdf_path: str):
+    def __init__(self, pdf_path: str):
         """
         Initializes the extractor with the path to the PDF file.
         """
@@ -222,26 +222,65 @@ class PDFOutlineExtractor:
         return {"title": title, "outline": outline}
 
 
+def _process_single_pdf(pdf_path: str) -> dict:
+    extractor = PDFOutlineExtractor(pdf_path)
+    outline = extractor.extract_outline()
+    try:
+        doc = fitz.open(pdf_path)
+        num_pages = doc.page_count
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+    outline["source_pdf"] = pdf_path.split("/")[-1]
+    outline["num_pages"] = num_pages
+    return outline
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Extract a structured outline from a PDF file.")
-    parser.add_argument("pdf_path", type=str, help="Path to the input PDF file.")
-    parser.add_argument("-o", "--output", type=str, help="Path to the output JSON file.")
+    parser = argparse.ArgumentParser(description="Extract a structured outline from a PDF file or directory of PDFs.")
+    parser.add_argument("input", type=str, help="Path to the input PDF file or a directory containing PDFs.")
+    parser.add_argument("-o", "--output", type=str, help="Path to the output JSON file when input is a single PDF. If input is a directory, provide an output directory.")
     args = parser.parse_args()
 
     try:
-        extractor = PDFOutlineExtractor(args.pdf_path)
-        document_outline = extractor.extract_outline()
-        json_output = json.dumps(document_outline, indent=2, ensure_ascii=False)
-
-        if args.output:
-            with open(args.output, 'w', encoding='utf-8') as f:
-                f.write(json_output)
-            print(f"Successfully extracted outline to {args.output}")
+        import os
+        if os.path.isdir(args.input):
+            if not args.output:
+                raise ValueError("When input is a directory, --output must be provided and point to an output directory.")
+            os.makedirs(args.output, exist_ok=True)
+            processed = 0
+            # Prefer PDFs subfolder if present
+            pdf_dir = os.path.join(args.input, 'PDFs') if os.path.isdir(os.path.join(args.input, 'PDFs')) else args.input
+            for name in sorted(os.listdir(pdf_dir)):
+                if not name.lower().endswith(".pdf"):
+                    continue
+                in_path = os.path.join(pdf_dir, name)
+                try:
+                    result = _process_single_pdf(in_path)
+                    out_name = os.path.splitext(name)[0] + ".json"
+                    out_path = os.path.join(args.output, out_name)
+                    with open(out_path, "w", encoding="utf-8") as f:
+                        json.dump(result, f, indent=2, ensure_ascii=False)
+                    print(f"Extracted outline -> {out_path}")
+                    processed += 1
+                except Exception as e:
+                    print(f"Failed to process {in_path}: {e}")
+            if processed == 0:
+                print("No PDFs found to process.")
         else:
-            print(json_output)
+            result = _process_single_pdf(args.input)
+            json_output = json.dumps(result, indent=2, ensure_ascii=False)
+            if args.output:
+                with open(args.output, 'w', encoding='utf-8') as f:
+                    f.write(json_output)
+                print(f"Successfully extracted outline to {args.output}")
+            else:
+                print(json_output)
 
     except Exception as e:
         print(f"An error occurred: {e}")
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     main()

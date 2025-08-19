@@ -5,9 +5,10 @@ FROM --platform=linux/amd64 python:3.10-slim
 # Set the working directory
 WORKDIR /app
 
+COPY wheels /wheels
 COPY requirements.txt .
-# Install minimal runtime deps
-RUN pip install --no-cache-dir -r requirements.txt
+# Install minimal runtime deps (offline)
+RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt
 
 # Copy the rest of the application code
 COPY . .

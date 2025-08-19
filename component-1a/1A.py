@@ -251,13 +251,16 @@ def main():
                 raise ValueError("When input is a directory, --output must be provided and point to an output directory.")
             os.makedirs(args.output, exist_ok=True)
             processed = 0
-            for name in sorted(os.listdir(args.input)):
+            # Prefer PDFs subfolder if present
+            pdf_dir = os.path.join(args.input, 'PDFs') if os.path.isdir(os.path.join(args.input, 'PDFs')) else args.input
+            for name in sorted(os.listdir(pdf_dir)):
                 if not name.lower().endswith(".pdf"):
                     continue
-                in_path = os.path.join(args.input, name)
+                in_path = os.path.join(pdf_dir, name)
                 try:
                     result = _process_single_pdf(in_path)
-                    out_path = os.path.join(args.output, f"{os.path.splitext(name)[0]}.json")
+                    out_name = os.path.splitext(name)[0] + ".json"
+                    out_path = os.path.join(args.output, out_name)
                     with open(out_path, "w", encoding="utf-8") as f:
                         json.dump(result, f, indent=2, ensure_ascii=False)
                     print(f"Extracted outline -> {out_path}")

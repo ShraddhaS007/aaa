@@ -311,7 +311,12 @@ def main():
 
     # If there are subdirectories, treat each as a collection; otherwise treat input_dir itself
     entries = [d for d in os.listdir(args.input_dir) if os.path.isdir(os.path.join(args.input_dir, d))]
-    collection_roots = entries if entries else ["."]
+    # If there's a challenge1b_input.json at the root, process the root first
+    root_json = os.path.join(args.input_dir, 'challenge1b_input.json')
+    if os.path.exists(root_json):
+        collection_roots = ["."]
+    else:
+        collection_roots = entries if entries else ["."]
 
     for collection_name in collection_roots:
         collection_dir = os.path.join(args.input_dir, collection_name) if collection_name != "." else args.input_dir
